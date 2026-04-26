@@ -6,10 +6,10 @@ description = ""
 readme = "README.md"
 requires-python = ">= 3.10"
 dependencies = [
-    # Latest 4.x; v5 migration is a follow-up commit.
-    "transformers>=4.57.6,<5.0.0",
+    # transformers v5 (PyTorch-only backend, AttentionInterface, etc.).
+    "transformers>=5.6.2",
     "accelerate>=1.13.0",
-    "datasets>=3.6.0",
+    "datasets>=4.0.0",
     "setuptools",
     "peft>=0.19.1",
     "jupyter",
@@ -28,7 +28,7 @@ dependencies = [
     "pandas",
     "plotly",
     "rouge-score",
-    "huggingface-hub[hf-transfer]>=0.32.0",
+    "huggingface-hub>=1.0.0",
     "opt-einsum>=3.4.0",
     "kagglehub[hf-datasets]>=0.3.12",
     "kaggle>=1.7.4.5",

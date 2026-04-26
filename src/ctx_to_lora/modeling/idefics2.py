@@ -20,15 +20,24 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.idefics2.configuration_idefics2 import Idefics2Config
 from transformers.utils import (
     add_start_docstrings,
     is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
     logging,
 )
+
+try:
+    from transformers.utils import is_flash_attn_greater_or_equal
+except ImportError:  # pragma: no cover
+    from transformers.utils import (
+        is_flash_attn_greater_or_equal_2_10 as _is_fa_ge_210,
+    )
+
+    def is_flash_attn_greater_or_equal(library_version: str) -> bool:
+        return library_version == "2.1.0" and _is_fa_ge_210()
+
 
 if is_flash_attn_2_available():
     from flash_attn.bert_padding import unpad_input
@@ -351,7 +360,7 @@ class Idefics2PerceiverFlashAttention2(Idefics2PerceiverAttention):
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal("2.1.0")
 
     # Ignore copy
     def forward(
@@ -710,17 +719,11 @@ class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
         compressed_context = latents
 
         if not self._use_flash_attention_2:
-            # SDPA path: skip the FA2-only unpad / cu_seq_lens dance. Convert
-            # the 2D padding mask to a [bsz, 1, n_latents, kv_len] additive
-            # mask for cross-attention; self-attn over latents is dense.
-            attn_mask_4d = (
-                _prepare_4d_attention_mask(
-                    attention_mask, latents.dtype, tgt_len=self.n_latents
-                )
-                if attention_mask is not None
-                else None
-            )
-            x_attn_kwargs = dict(attention_mask=attn_mask_4d)
+            # SDPA path: skip the FA2-only unpad / cu_seq_lens dance. The 2D
+            # padding mask is converted to the additive [bsz, 1, q, kv] form
+            # inside Idefics2PerceiverSdpaAttention, so we just pass it
+            # through. Self-attn over latents is dense (no mask needed).
+            x_attn_kwargs = dict(attention_mask=attention_mask)
             self_attn_kwargs = dict(attention_mask=None)
             for i, layer in enumerate(self.layers):
                 inp_kwargs = dict(

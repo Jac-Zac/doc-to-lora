@@ -103,7 +103,7 @@ def get_emb_model_and_fns(emb_model_name, device):
     emb_model = AutoModel.from_pretrained(
         emb_model_name,
         device_map=device,
-        torch_dtype=torch.float32 if "gte" in emb_model_name else torch.bfloat16,
+        dtype=torch.float32 if "gte" in emb_model_name else torch.bfloat16,
         trust_remote_code=True,
     ).eval()
     emb_tokenizer = AutoTokenizer.from_pretrained(emb_model_name)
@@ -185,7 +185,7 @@ def get_model(
     model_init_kwargs = dict(
         pretrained_model_name_or_path=model_path,
         device_map=device,
-        torch_dtype=dtype,
+        dtype=dtype,
         trust_remote_code=True,
     )
     if model_kwargs is not None:
