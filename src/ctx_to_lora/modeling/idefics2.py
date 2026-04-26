@@ -447,10 +447,84 @@ class Idefics2PerceiverFlashAttention2(Idefics2PerceiverAttention):
         return attn_output, attn_weights, past_key_value
 
 
+class Idefics2PerceiverSdpaAttention(Idefics2PerceiverAttention):
+    """SDPA fallback for the perceiver attention.
+
+    Same weight layout as the FA2 class so existing checkpoints load 1:1, but
+    routes through ``torch.nn.functional.scaled_dot_product_attention``. On
+    PyTorch >= 2.7 with Blackwell SDPA dispatches to FA2-class kernels, so the
+    perf gap vs flash-attn-2 is negligible for inference.
+    """
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        is_cross_attn: bool,
+        context: torch.Tensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+        bsz, q_len, _ = latents.size()
+        kv_inp = context if is_cross_attn else latents
+        kv_len = kv_inp.size(1)
+
+        query_states = self.q_proj(latents).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = self.k_proj(kv_inp).view(
+            bsz, kv_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = self.v_proj(kv_inp).view(
+            bsz, kv_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # SDPA expects an additive mask in the same dtype as Q. The FA2 path
+        # accepts a [bsz, kv_len] padding mask; convert it to the [bsz, 1, q, kv]
+        # additive form SDPA wants.
+        attn_bias = None
+        if attention_mask is not None and attention_mask.dim() == 2:
+            pad = (attention_mask == 0).view(bsz, 1, 1, kv_len)
+            attn_bias = torch.zeros(
+                bsz, 1, q_len, kv_len, dtype=query_states.dtype, device=query_states.device
+            ).masked_fill(pad, torch.finfo(query_states.dtype).min)
+        elif attention_mask is not None and attention_mask.dim() == 4:
+            attn_bias = attention_mask.to(query_states.dtype)
+
+        dropout_p = self.attention_dropout if self.training else 0.0
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attn_bias,
+            dropout_p=dropout_p,
+            is_causal=False,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(
+            bsz, q_len, self.num_heads * self.head_dim
+        )
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
 IDEFICS2_PERCEIVER_ATTENTION_CLASSES = {
     # "eager": Idefics2PerceiverAttention,
-    "flash_attention_2": Idefics2PerceiverFlashAttention2,
+    "sdpa": Idefics2PerceiverSdpaAttention,
 }
+if is_flash_attn_2_available():
+    IDEFICS2_PERCEIVER_ATTENTION_CLASSES["flash_attention_2"] = (
+        Idefics2PerceiverFlashAttention2
+    )
 
 
 class Idefics2PerceiverLayer(nn.Module):
@@ -566,7 +640,8 @@ IDEFICS2_INPUTS_DOCSTRING = r"""
     IDEFICS2_START_DOCSTRING,
 )
 class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
-    _supports_sdpa = False
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
     config_class = Idefics2PerceiverConfig
 
     def __init__(self, config) -> None:
@@ -612,7 +687,10 @@ class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
         self.layernorm = Idefics2RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        assert self._use_flash_attention_2
+        assert config._attn_implementation in IDEFICS2_PERCEIVER_ATTENTION_CLASSES, (
+            f"unsupported attn_implementation={config._attn_implementation!r}; "
+            f"expected one of {list(IDEFICS2_PERCEIVER_ATTENTION_CLASSES)}"
+        )
 
     def forward(
         self,
@@ -629,15 +707,37 @@ class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
 
         latents = self.latents_q.unsqueeze(0).expand((bsz, *self.latents_q.size()))
 
-        attention_mask = (
-            _prepare_4d_attention_mask(
-                attention_mask, latents.dtype, tgt_len=self.n_latents
-            )
-            if not self._use_flash_attention_2
-            else attention_mask
-        )
-
         compressed_context = latents
+
+        if not self._use_flash_attention_2:
+            # SDPA path: skip the FA2-only unpad / cu_seq_lens dance. Convert
+            # the 2D padding mask to a [bsz, 1, n_latents, kv_len] additive
+            # mask for cross-attention; self-attn over latents is dense.
+            attn_mask_4d = (
+                _prepare_4d_attention_mask(
+                    attention_mask, latents.dtype, tgt_len=self.n_latents
+                )
+                if attention_mask is not None
+                else None
+            )
+            x_attn_kwargs = dict(attention_mask=attn_mask_4d)
+            self_attn_kwargs = dict(attention_mask=None)
+            for i, layer in enumerate(self.layers):
+                inp_kwargs = dict(
+                    latents=compressed_context,
+                    context=context,
+                    past_key_value=None,
+                    output_attentions=False,
+                    use_cache=False,
+                )
+                if layer.is_cross_attn:
+                    attn_kwargs = {**inp_kwargs, **x_attn_kwargs}
+                else:
+                    attn_kwargs = {**inp_kwargs, **self_attn_kwargs}
+                layer_outputs = layer(**attn_kwargs)
+                compressed_context = layer_outputs[0]
+            compressed_context = self.layernorm(compressed_context)
+            return compressed_context
 
         cu_seq_lens_q = torch.tensor(
             [self.n_latents] * (bsz + 1), device=context.device, dtype=torch.int32

@@ -191,7 +191,11 @@ def get_model(
     if model_kwargs is not None:
         model_init_kwargs.update(model_kwargs)
     if use_flash_attn:
-        model_init_kwargs["attn_implementation"] = "flash_attention_2"
+        from ctx_to_lora.model_loading import _resolve_attn_impl
+
+        model_init_kwargs["attn_implementation"] = _resolve_attn_impl(
+            use_flash_attn, model_path
+        )
     if train:
         # for training disable cache
         model_init_kwargs["use_cache"] = False

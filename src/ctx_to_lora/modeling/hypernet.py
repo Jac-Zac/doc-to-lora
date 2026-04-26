@@ -544,7 +544,7 @@ class ModulatedPretrainedModel(nn.Module):
             ctx_model_name,
             train=self.base_model.training,
             requires_grad=False,
-            use_flash_attn=base_model_attn_impl == "flash_attention_2",
+            use_flash_attn=base_model_attn_impl in ("flash_attention_2", "sdpa"),
             use_q_lora=self.ctx_encoder_args.quantize_ctx_encoder,
         )
         self.ctx_encoder = CTX_ENCODER_CLS[self.ctx_encoder_args.ctx_encoder_type](

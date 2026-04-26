@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -14,6 +15,15 @@ from ctx_to_lora.configs import (
     AggregatorArguments,
 )
 from ctx_to_lora.modeling.idefics2 import Idefics2Perceiver, Idefics2PerceiverConfig
+
+# Pick the perceiver attention backend at import time. flash_attention_2 has
+# no prebuilt wheel for cu13 / torch>=2.9, so on Blackwell the SDPA path is
+# the standard one; on older stacks we still prefer flash-attn-2 for parity.
+_PERCEIVER_ATTN_IMPL = (
+    "flash_attention_2"
+    if importlib.util.find_spec("flash_attn") is not None
+    else "sdpa"
+)
 from ctx_to_lora.pooling import POOL_FN
 from ctx_to_lora.utils import (
     get_num_layers,
@@ -112,7 +122,7 @@ class Perceiver(nn.Module):
             n_latents=n_latent_queries,
             intermediate_size_factor=4,
             hidden_size=output_size,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_PERCEIVER_ATTN_IMPL,
         )
         self.decoder_config = Idefics2PerceiverConfig(
             input_size=output_size,
@@ -122,7 +132,7 @@ class Perceiver(nn.Module):
             n_latents=n_output_queries,
             intermediate_size_factor=4,
             hidden_size=output_size,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_PERCEIVER_ATTN_IMPL,
         )
         self.perceiver = Idefics2Perceiver(self.config, self.decoder_config)
         self.iterative_mode = False

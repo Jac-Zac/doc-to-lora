@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 import os
 
@@ -14,6 +15,30 @@ from transformers import (
 )
 
 logger = logging.getLogger()
+
+
+def _flash_attn_2_installed() -> bool:
+    return importlib.util.find_spec("flash_attn") is not None
+
+
+def _resolve_attn_impl(use_flash_attn: bool, model_name_or_path: str) -> str:
+    """Pick an attention backend. Falls back to SDPA when flash-attn isn't installed.
+
+    On PyTorch >= 2.7 with Blackwell, SDPA dispatches to FA2-class kernels, so
+    SDPA is a near-equivalent drop-in for inference and training when the
+    flash_attn package is unavailable (e.g. no cu13/torch>=2.9 prebuilt wheel).
+    """
+    if not use_flash_attn:
+        return "eager"
+    if "gte" in model_name_or_path:
+        return "sdpa"
+    if _flash_attn_2_installed():
+        return "flash_attention_2"
+    logger.info(
+        "flash_attn not installed; falling back to sdpa "
+        "(uses FA2-class kernels on modern PyTorch + Blackwell)."
+    )
+    return "sdpa"
 
 GEMMA_VISION_MODELS = [
     "google/gemma-3-4b-it",
@@ -119,11 +144,9 @@ def get_model(
         "bert" in model_name_or_path.lower() or "gte" in model_name_or_path.lower()
     )
 
-    if use_flash_attn:
-        if "gte" not in model_name_or_path:
-            model_init_kwargs["attn_implementation"] = "flash_attention_2"
-        elif "gte" in model_name_or_path:
-            model_init_kwargs["attn_implementation"] = "sdpa"
+    model_init_kwargs["attn_implementation"] = _resolve_attn_impl(
+        use_flash_attn, model_name_or_path
+    )
 
     if is_vision_model:
         # always use sdpa for vision models
